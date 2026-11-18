@@ -75,6 +75,18 @@ function ReviewMatchesContent() {
     return batchItems;
   }, [matches, activeBatch?.id, queueFilter, paramMatchId]);
 
+  const batchReviewCount = useMemo(() => {
+    return matches.filter(
+      (m) => m.batchId === activeBatch?.id && (m.status === "needs_review" || m.status === "conflict")
+    ).length;
+  }, [matches, activeBatch?.id]);
+
+  const globalReviewCount = useMemo(() => {
+    return matches.filter(
+      (m) => m.status === "needs_review" || m.status === "conflict"
+    ).length;
+  }, [matches]);
+
   const currentMatch = useMemo(() => {
     if (activeMatchId) {
       const byId = queueItems.find((q) => q.id === activeMatchId) ?? matches.find((m) => m.id === activeMatchId);
@@ -247,12 +259,17 @@ function ReviewMatchesContent() {
     >
       <PageHeader
         title="Review Matches"
-        subtitle="Compare Item Master CSV attributes side-by-side with Frido's permanent Word prize stickers before approving."
+        subtitle={`Compare Item Master CSV attributes side-by-side with Frido's permanent Word prize stickers before approving. ${batchReviewCount} items in this batch need review.`}
         meta={
           <>
             <span className="rounded-lg border border-[#EAEAE7] bg-white px-2.5 py-1 font-mono text-xs font-semibold text-[#171717]">
-              {currentMatch.batchId}
+              {activeBatch?.id ?? currentMatch.batchId}
             </span>
+            {activeBatch?.csvFilename && (
+              <span className="rounded-lg border border-[#EAEAE7] bg-white px-2.5 py-1 text-xs text-[#666666]">
+                {activeBatch.csvFilename}
+              </span>
+            )}
             <StatusBadge status={currentMatch.status} size="md" />
             <MatchTypeBadge matchType={currentMatch.matchType} />
           </>
@@ -291,12 +308,21 @@ function ReviewMatchesContent() {
 
       {/* Queue Navigator Bar */}
       <div className="flex flex-col justify-between gap-3 rounded-2xl border border-[#EAEAE7] bg-white px-4 py-3 sm:flex-row sm:items-center">
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <span className="text-xs font-medium text-[#666666] tabular-nums">
             {currentIndex >= 0
               ? `Item ${currentIndex + 1} of ${queueItems.length}`
               : `${queueItems.length} item(s) in queue`}
           </span>
+          <span className="text-xs text-[#DCDCD7]">|</span>
+          <span className="text-xs text-[#171717]">
+            <strong>{batchReviewCount}</strong> items in this batch ({activeBatch?.id ?? currentMatch.batchId}) need review
+          </span>
+          {globalReviewCount !== batchReviewCount && (
+            <span className="text-[11px] text-[#888888]">
+              ({globalReviewCount} overall across all batches)
+            </span>
+          )}
           <select
             aria-label="Select item from review queue"
             value={currentMatch.id}
@@ -727,7 +753,7 @@ function ReviewMatchesContent() {
         title={`Approve match for ${currentMatch.product.productCode}?`}
         description={`Confirm linking this Item Master product to sticker ${
           activeSticker?.stickerIdentifier ?? ""
-        }. This updates local frontend demonstration state.`}
+        }. This decision is saved permanently to PostgreSQL and appended to the audit history. It cannot be undone automatically.`}
         confirmLabel="Approve Match"
         variant="approve"
       >

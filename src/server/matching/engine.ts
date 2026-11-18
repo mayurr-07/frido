@@ -141,11 +141,9 @@ export function compareDimensions(
   sticker: number[] | null
 ): "match" | "differs" | "missing" {
   if (!csv || !sticker) return "missing";
-  const length = Math.min(csv.length, sticker.length);
-  if (length < 2) return "missing";
-  const comparable = csv
-    .slice(0, length)
-    .map((value, index) => ({ csv: value, sticker: sticker[index] }));
+  if (csv.length !== sticker.length) return "differs";
+  if (csv.length < 2) return "missing";
+  const comparable = csv.map((value, index) => ({ csv: value, sticker: sticker[index] }));
   const allMatch = comparable.every(
     (pair) => Math.abs(pair.csv - pair.sticker) / Math.max(pair.csv, pair.sticker) <= 0.05
   );
@@ -363,6 +361,39 @@ export function matchProduct(
   const stickerByIdentifier = (identifier: string) =>
     stickers.find((s) => normalizeCode(s.stickerIdentifier) === normalizeCode(identifier));
   const activeMappings = mappings.filter((m) => m.isActive);
+
+  /* -------- R0: overlapping mapping conflict detection ----------------- */
+  const matchingActiveMappings = activeMappings.filter((m) => {
+    const source = m.matchField === "scan_identifier" ? scan : code;
+    return wildcardMatch(m.csvPattern, source);
+  });
+  if (matchingActiveMappings.length > 1) {
+    const overlapStickers = matchingActiveMappings
+      .map((m) => stickerByIdentifier(m.stickerIdentifier))
+      .filter((s): s is EngineSticker => s !== undefined);
+    return {
+      productId: product.id,
+      status: "conflict",
+      matchType: "exact_approved_mapping",
+      ruleId: "R0_MAPPING_OVERLAP",
+      ruleApplied: "R0 · Overlapping mapping conflict — multiple active patterns match this product",
+      stickerId: null,
+      candidateStickerIds: overlapStickers.map((s) => s.id),
+      reviewReason: `Multiple active mapping patterns (${matchingActiveMappings.map((m) => m.csvPattern).join(", ")}) match ${product.productCode}; ambiguity must be resolved manually.`,
+      conflictWarnings: [
+        `Overlapping mappings detected: ${matchingActiveMappings.map((m) => `"${m.csvPattern}" → ${m.stickerIdentifier}`).join(", ")}`,
+      ],
+      evidence: [
+        {
+          code: "C-MAPPING-OVERLAP",
+          type: "conflict",
+          title: "Multiple active mapping patterns overlap",
+          detail: `Patterns ${matchingActiveMappings.map((m) => `"${m.csvPattern}"`).join(", ")} all match product code / scan identifier. Deactivate all but one before this product can be automatically classified.`,
+        },
+      ],
+      attributeComparisons: attributeComparisons(product, overlapStickers[0] ?? null),
+    };
+  }
 
   /* -------- R1: exact approved product-to-sticker mapping -------------- */
   const exactMapping = activeMappings.find((m) => {

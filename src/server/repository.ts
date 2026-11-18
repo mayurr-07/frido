@@ -145,7 +145,7 @@ function toSticker(row: StickerRow): StickerReference {
   };
 }
 
-const productSelect = {
+export const productSelect = {
   matchId: matchResults.id,
   status: matchResults.status,
   matchType: matchResults.matchType,
@@ -169,8 +169,8 @@ const productSelect = {
   stickerDocumentSource: stickerDocuments.source,
 };
 
-async function fetchMatches(batchCodes?: string[], limit = 500): Promise<MatchResult[]> {
-  const base = db
+function getProductSelectQuery() {
+  return db
     .select(productSelect)
     .from(matchResults)
     .innerJoin(csvBatches, eq(matchResults.batchId, csvBatches.id))
@@ -178,23 +178,76 @@ async function fetchMatches(batchCodes?: string[], limit = 500): Promise<MatchRe
     .leftJoin(stickerReferences, eq(matchResults.stickerId, stickerReferences.id))
     .leftJoin(stickerDocuments, eq(stickerReferences.documentId, stickerDocuments.id))
     .leftJoin(users, eq(matchResults.reviewedBy, users.id));
+}
+
+export type ProductSelectRow = Awaited<ReturnType<typeof getProductSelectQuery>>[number];
+
+async function fetchMatches(batchCodes?: string[], limit = 500): Promise<MatchResult[]> {
+  const base = getProductSelectQuery();
 
   const rows = batchCodes && batchCodes.length > 0
     ? await base.where(inArray(csvBatches.batchCode, batchCodes)).orderBy(asc(importedProducts.rowNumber)).limit(limit)
     : await base.orderBy(desc(csvBatches.uploadedAt), asc(importedProducts.rowNumber)).limit(limit);
 
+  return hydrateMatchRows(rows);
+}
+
+export async function fetchAllMatchesForBatch(batchId: string): Promise<MatchResult[]> {
+  const CHUNK_SIZE = 1000;
+  let offset = 0;
+  const allRows: ProductSelectRow[] = [];
+
+  while (true) {
+    const chunk = await db
+      .select(productSelect)
+      .from(matchResults)
+      .innerJoin(csvBatches, eq(matchResults.batchId, csvBatches.id))
+      .innerJoin(importedProducts, eq(matchResults.productId, importedProducts.id))
+      .leftJoin(stickerReferences, eq(matchResults.stickerId, stickerReferences.id))
+      .leftJoin(stickerDocuments, eq(stickerReferences.documentId, stickerDocuments.id))
+      .leftJoin(users, eq(matchResults.reviewedBy, users.id))
+      .where(
+        or(
+          eq(csvBatches.batchCode, batchId),
+          sql`${csvBatches.id}::text = ${batchId}`
+        )
+      )
+      .orderBy(asc(importedProducts.rowNumber))
+      .limit(CHUNK_SIZE)
+      .offset(offset);
+
+    allRows.push(...chunk);
+    if (chunk.length < CHUNK_SIZE) {
+      break;
+    }
+    offset += CHUNK_SIZE;
+  }
+
+  return hydrateMatchRows(allRows);
+}
+
+export async function hydrateMatchRows(rows: ProductSelectRow[]): Promise<MatchResult[]> {
   const matchIds = rows.map((r) => r.matchId);
-  const decisions = matchIds.length
-    ? await db
+  const decisions: Array<{
+    decision: typeof reviewDecisions.$inferSelect;
+    stickerIdentifier: string | null;
+  }> = [];
+
+  if (matchIds.length > 0) {
+    for (let i = 0; i < matchIds.length; i += 500) {
+      const slice = matchIds.slice(i, i + 500);
+      const chunk = await db
         .select({
           decision: reviewDecisions,
           stickerIdentifier: stickerReferences.stickerIdentifier,
         })
         .from(reviewDecisions)
         .leftJoin(stickerReferences, eq(reviewDecisions.selectedStickerId, stickerReferences.id))
-        .where(inArray(reviewDecisions.matchId, matchIds))
-        .orderBy(desc(reviewDecisions.createdAt))
-    : [];
+        .where(inArray(reviewDecisions.matchId, slice))
+        .orderBy(desc(reviewDecisions.createdAt));
+      decisions.push(...chunk);
+    }
+  }
 
   const historyByMatch = new Map<string, ReviewAction[]>();
   for (const { decision, stickerIdentifier } of decisions) {
@@ -221,6 +274,38 @@ async function fetchMatches(batchCodes?: string[], limit = 500): Promise<MatchRe
     historyByMatch.set(decision.matchId, list);
   }
 
+  // Collect all unique candidateStickerIds across all rows for bulk hydration
+  const allCandidateIds = Array.from(
+    new Set(rows.flatMap((r) => (r.candidateStickerIds as string[]) ?? []))
+  );
+
+  const candidateStickerMap = new Map<string, StickerReference>();
+  if (allCandidateIds.length > 0) {
+    for (let i = 0; i < allCandidateIds.length; i += 500) {
+      const slice = allCandidateIds.slice(i, i + 500);
+      const candidateRows = await db
+        .select({
+          sticker: stickerReferences,
+          documentName: stickerDocuments.filename,
+          documentSource: stickerDocuments.source,
+        })
+        .from(stickerReferences)
+        .leftJoin(stickerDocuments, eq(stickerReferences.documentId, stickerDocuments.id))
+        .where(inArray(stickerReferences.id, slice));
+
+      for (const cr of candidateRows) {
+        candidateStickerMap.set(
+          cr.sticker.id,
+          toSticker({
+            ...cr.sticker,
+            documentName: cr.documentName ?? "unknown.docx",
+            documentSource: cr.documentSource ?? "uploaded",
+          })
+        );
+      }
+    }
+  }
+
   return rows.map((row) => {
     const sticker = row.sticker
       ? toSticker({
@@ -230,6 +315,10 @@ async function fetchMatches(batchCodes?: string[], limit = 500): Promise<MatchRe
         })
       : null;
     const p = row.product;
+    const candidateIds: string[] = (row.candidateStickerIds as string[]) ?? [];
+    const candidateStickers = candidateIds
+      .map((id) => candidateStickerMap.get(id))
+      .filter((s): s is StickerReference => s !== undefined);
     return {
       id: row.matchId,
       batchId: row.batchCode,
@@ -258,7 +347,7 @@ async function fetchMatches(batchCodes?: string[], limit = 500): Promise<MatchRe
         catalogCategory: p.catalogCategory ?? undefined,
       },
       matchedSticker: sticker,
-      candidateStickers: sticker ? [sticker] : [],
+      candidateStickers: candidateStickers.length > 0 ? candidateStickers : (sticker ? [sticker] : []),
       matchType: (row.matchType as MatchType) ?? "no_reference",
       status: row.status,
       matchingRuleApplied: row.ruleApplied,
@@ -266,7 +355,7 @@ async function fetchMatches(batchCodes?: string[], limit = 500): Promise<MatchRe
       engineVersion: row.engineVersion,
       reviewReason: row.reviewReason ?? undefined,
       conflictWarnings: row.conflictWarnings ?? [],
-      evidence: (row.evidence ?? []).map((item, index) => ({
+      evidence: ((row.evidence as Array<{ code: string; type: string; title: string; detail: string }>) ?? []).map((item, index) => ({
         id: `${row.matchId}-ev-${index}`,
         code: item.code,
         type: item.type as "positive" | "warning" | "conflict" | "neutral",
@@ -625,7 +714,7 @@ export async function resolveBatch(codeOrId: string) {
 export async function getBatchDetail(codeOrId: string) {
   const resolved = await resolveBatch(codeOrId);
   if (!resolved) throw new ApiError(404, "Batch not found");
-  const matches = await fetchMatches([resolved.batch.batchCode]);
+  const matches = await fetchAllMatchesForBatch(resolved.batch.batchCode);
   const products = await db
     .select()
     .from(importedProducts)
@@ -663,12 +752,7 @@ export async function recordReviewDecision(options: {
     .from(matchResults)
     .innerJoin(csvBatches, eq(matchResults.batchId, csvBatches.id))
     .innerJoin(importedProducts, eq(matchResults.productId, importedProducts.id))
-    .where(
-      or(
-        sql`${matchResults.id}::text = ${matchId}`,
-        and(eq(csvBatches.batchCode, matchId), eq(importedProducts.productCode, importedProducts.productCode))
-      )
-    )
+    .where(sql`${matchResults.id}::text = ${matchId}`)
     .limit(1);
 
   const record = rows[0];
@@ -685,16 +769,55 @@ export async function recordReviewDecision(options: {
     if (!requestedStickerId) {
       throw new ApiError(422, "Approval requires a selected sticker reference");
     }
+
     const stickerRows = await db
-      .select({ id: stickerReferences.id })
+      .select({ id: stickerReferences.id, stickerIdentifier: stickerReferences.stickerIdentifier })
       .from(stickerReferences)
       .where(or(eq(stickerReferences.id, requestedStickerId), eq(stickerReferences.stickerIdentifier, requestedStickerId)))
       .limit(1);
     if (stickerRows.length === 0) {
       throw new ApiError(422, "Selected sticker reference does not exist");
     }
-    stickerId = stickerRows[0].id;
-    selectedStickerId = stickerRows[0].id;
+
+    const targetSticker = stickerRows[0];
+    const candidateIds: string[] = (record.match.candidateStickerIds as string[]) ?? [];
+    let isCandidate = candidateIds.includes(targetSticker.id);
+
+    if (!isCandidate) {
+      // Check if there is an explicitly approved active mapping linking this product to the sticker
+      const activeMappings = await db
+        .select()
+        .from(productFamilyMappings)
+        .where(
+          and(
+            eq(productFamilyMappings.isActive, true),
+            eq(productFamilyMappings.stickerIdentifier, targetSticker.stickerIdentifier)
+          )
+        );
+      const code = (record.product.productCode ?? "").trim().toUpperCase();
+      const scan = (record.product.scanIdentifier ?? "").trim().toUpperCase();
+      isCandidate = activeMappings.some((m) => {
+        const source = m.matchField === "scan_identifier" ? scan : code;
+        if (!source) return false;
+        const pat = m.csvPattern.trim().toUpperCase();
+        if (pat.endsWith("*")) {
+          return source.startsWith(pat.slice(0, -1));
+        }
+        return pat === source;
+      });
+    }
+
+    if (!isCandidate) {
+      throw new ApiError(422, "Selected sticker is not a valid candidate for this match");
+    }
+
+    // For conflict overrides, require a reviewer justification note
+    if (previousStatus === "conflict" && (!note || note.trim() === "")) {
+      throw new ApiError(422, "Conflict overrides require a reviewer justification note");
+    }
+
+    stickerId = targetSticker.id;
+    selectedStickerId = targetSticker.id;
     newStatus = "confirmed";
     reviewState = "approved";
   } else if (action === "reject" || action === "mark_unmatched") {
@@ -784,6 +907,31 @@ export async function recordReviewDecision(options: {
 export async function bulkApproveMatches(matchIds: string[], user: SessionUser) {
   const results: Array<{ matchId: string; approved: boolean; reason?: string }> = [];
   for (const matchId of matchIds) {
+    // Server-side revalidation: fetch the match before attempting approval
+    const rows = await db
+      .select({ match: matchResults })
+      .from(matchResults)
+      .where(sql`${matchResults.id}::text = ${matchId}`)
+      .limit(1);
+
+    const record = rows[0];
+    if (!record) {
+      results.push({ matchId, approved: false, reason: "Match result not found" });
+      continue;
+    }
+
+    // Conflict matches require individual review
+    if (record.match.status === "conflict") {
+      results.push({ matchId, approved: false, reason: "Conflict matches require individual review — bulk approval skipped" });
+      continue;
+    }
+
+    // No sticker reference means approval cannot proceed
+    if (record.match.stickerId === null) {
+      results.push({ matchId, approved: false, reason: "No verified sticker reference — approval requires a sticker selection" });
+      continue;
+    }
+
     try {
       const result = await recordReviewDecision({
         matchId,
@@ -940,7 +1088,7 @@ export async function createReport(options: {
   const resolved = await resolveBatch(options.batchCodeOrId);
   if (!resolved) throw new ApiError(404, "Batch not found");
 
-  const matches = await fetchMatches([resolved.batch.batchCode]);
+  const matches = await fetchAllMatchesForBatch(resolved.batch.batchCode);
   const scoped = scopeMatches(reportTypeScope(options.reportType), matches);
   const sequence = await db.select({ count: sql<number>`count(*)::int` }).from(reports);
   const reportCode = `RPT-${new Date().getFullYear()}-${String(110 + (sequence[0]?.count ?? 0)).padStart(3, "0")}`;
@@ -996,7 +1144,7 @@ export async function getReportPdfData(codeOrId: string) {
   const record = rows[0];
   if (!record) throw new ApiError(404, "Report not found");
 
-  const matches = await fetchMatches([record.batch.batchCode]);
+  const matches = await fetchAllMatchesForBatch(record.batch.batchCode);
   const scoped = scopeMatches(reportTypeScope(record.report.reportType), matches);
 
   return {

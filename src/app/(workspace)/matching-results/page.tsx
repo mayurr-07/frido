@@ -62,6 +62,13 @@ function MatchingResultsContent() {
     preferences,
     bulkApproveMatches,
     createReport,
+    serverMatches,
+    matchPage,
+    matchPageSize,
+    matchTotalCount,
+    matchAggregations,
+    matchesLoading,
+    fetchMatchPage,
   } = useFridoStore();
 
   const paramBatch = searchParams.get("batch");
@@ -98,22 +105,49 @@ function MatchingResultsContent() {
     [batches, activeBatchId]
   );
 
-  // All matches belonging to current batch
-  const batchMatches = useMemo(
-    () => matches.filter((m) => m.batchId === currentBatch?.id),
-    [matches, currentBatch?.id]
-  );
+  // Debounce global search query for server-side fetch
+  const [debouncedQuery, setDebouncedQuery] = useState(globalQuery);
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedQuery(globalQuery), 300);
+    return () => clearTimeout(timer);
+  }, [globalQuery]);
 
-  // Sync selected drawer item with live store updates
+  // Trigger server fetch when status or debounced query changes
+  useEffect(() => {
+    if (currentBatch) {
+      const batchUuid = currentBatch.uuid ?? currentBatch.id;
+      void fetchMatchPage(batchUuid, {
+        page: 1,
+        pageSize: matchPageSize,
+        status: statusFilter !== "all" ? statusFilter : undefined,
+        q: debouncedQuery || undefined,
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statusFilter, debouncedQuery, currentBatch?.uuid, currentBatch?.id]);
+
+  // Sync selected drawer item with live server matches
   const liveSelectedMatch = useMemo(
     () =>
       selectedMatch
-        ? matches.find((m) => m.id === selectedMatch.id) ?? null
+        ? (serverMatches.find((m) => m.id === selectedMatch.id) ?? matches.find((m) => m.id === selectedMatch.id) ?? null)
         : null,
-    [selectedMatch, matches]
+    [selectedMatch, serverMatches, matches]
   );
 
+  // Status card counts — from full-batch aggregations (server-side, not page-limited)
   const counts = useMemo(() => {
+    if (matchAggregations) {
+      return {
+        all: matchAggregations.all,
+        confirmed: matchAggregations.confirmed,
+        needs_review: matchAggregations.needs_review,
+        conflict: matchAggregations.conflict,
+        unmatched: matchAggregations.unmatched,
+      };
+    }
+    // Fallback to bootstrap data while aggregations load
+    const batchMatches = matches.filter((m) => m.batchId === currentBatch?.id);
     return {
       all: batchMatches.length,
       confirmed: batchMatches.filter((m) => m.status === "confirmed").length,
@@ -121,34 +155,31 @@ function MatchingResultsContent() {
       conflict: batchMatches.filter((m) => m.status === "conflict").length,
       unmatched: batchMatches.filter((m) => m.status === "unmatched").length,
     };
-  }, [batchMatches]);
+  }, [matchAggregations, matches, currentBatch?.id]);
 
+  // For the table, apply client-side match-type filter and code filter to serverMatches
   const filteredData = useMemo(() => {
-    const q = globalQuery.trim().toLowerCase();
     const cq = codeQuery.trim().toLowerCase();
-
-    return batchMatches.filter((row) => {
-      if (statusFilter !== "all" && row.status !== statusFilter) return false;
+    return serverMatches.filter((row) => {
       if (matchTypeFilter !== "all" && row.matchType !== matchTypeFilter) return false;
-
       if (cq && !row.product.productCode.toLowerCase().includes(cq)) return false;
-
-      if (q) {
-        const haystack = [
-          row.product.productCode,
-          row.product.name,
-          row.matchedSticker?.stickerIdentifier ?? "",
-          row.matchedSticker?.documentName ?? "",
-          row.evidence.map((e) => e.title).join(" "),
-        ]
-          .join(" ")
-          .toLowerCase();
-        if (!haystack.includes(q)) return false;
-      }
-
       return true;
     });
-  }, [batchMatches, statusFilter, matchTypeFilter, globalQuery, codeQuery]);
+  }, [serverMatches, matchTypeFilter, codeQuery]);
+
+  // Pagination calculations
+  const totalPages = Math.max(1, Math.ceil(matchTotalCount / matchPageSize));
+
+  const goToPage = (page: number) => {
+    if (!currentBatch) return;
+    const batchUuid = currentBatch.uuid ?? currentBatch.id;
+    void fetchMatchPage(batchUuid, {
+      page,
+      pageSize: matchPageSize,
+      status: statusFilter !== "all" ? statusFilter : undefined,
+      q: debouncedQuery || undefined,
+    });
+  };
 
   // Clear selection when batch or filter changes
   useEffect(() => {
@@ -324,7 +355,8 @@ function MatchingResultsContent() {
     },
     initialState: {
       pagination: {
-        pageSize: preferences.defaultPageSize,
+        // Show all rows on the current server page; server controls actual paging
+        pageSize: 100,
       },
     },
     onSortingChange: setSorting,
@@ -338,8 +370,8 @@ function MatchingResultsContent() {
 
   const selectedRowIds = Object.keys(rowSelection).filter((id) => rowSelection[id]);
   const approvableSelectedIds = selectedRowIds.filter((id) => {
-    const found = batchMatches.find((m) => m.id === id);
-    return found && found.matchedSticker && found.status !== "confirmed";
+    const found = serverMatches.find((m) => m.id === id) ?? matches.find((m) => m.id === id);
+    return found && found.matchedSticker && found.status !== "confirmed" && found.status !== "conflict";
   });
 
   const handleDownloadReport = async () => {
@@ -401,7 +433,19 @@ function MatchingResultsContent() {
             <select
               aria-label="Select Item Master Batch"
               value={currentBatch?.id ?? ""}
-              onChange={(e) => setActiveBatchId(e.target.value)}
+              onChange={(e) => {
+                const newBatchId = e.target.value;
+                setActiveBatchId(newBatchId);
+                const target = batches.find((b) => b.id === newBatchId || b.uuid === newBatchId);
+                if (target) {
+                  void fetchMatchPage(target.uuid ?? target.id, {
+                    page: 1,
+                    pageSize: matchPageSize,
+                    status: statusFilter !== "all" ? statusFilter : undefined,
+                    q: debouncedQuery || undefined,
+                  });
+                }
+              }}
               className="h-10 rounded-[9px] border border-[#DCDCD7] bg-white px-3 text-xs font-medium text-[#171717] focus:border-[#171717] focus:outline-none"
             >
               {batches.map((b) => (
@@ -714,7 +758,7 @@ function MatchingResultsContent() {
         )}
 
         {/* Table Content Area */}
-        {viewModeState === "loading" ? (
+        {viewModeState === "loading" || matchesLoading ? (
           <div className="p-4">
             <TableLoadingSkeleton rows={6} />
           </div>
@@ -727,12 +771,12 @@ function MatchingResultsContent() {
             <EmptyState
               icon={FileSearch}
               title={
-                batchMatches.length === 0
+                matchTotalCount === 0
                   ? "No matching records in this batch"
                   : "No matching products found"
               }
               description={
-                batchMatches.length === 0
+                matchTotalCount === 0
                   ? "Upload an Item Master CSV to populate matching results."
                   : "Try adjusting your search query, Product Code filter, or selected status tab."
               }
@@ -814,13 +858,33 @@ function MatchingResultsContent() {
               </table>
             </div>
 
-            <Pagination
-              pageIndex={table.getState().pagination.pageIndex}
-              pageSize={table.getState().pagination.pageSize}
-              totalItems={filteredData.length}
-              onPageChange={(idx) => table.setPageIndex(idx)}
-              onPageSizeChange={(size) => table.setPageSize(size)}
-            />
+            <div className="flex flex-col items-center justify-between gap-3 border-t border-[#EAEAE7] px-4 py-3 sm:flex-row">
+              <span className="text-xs text-[#666666] tabular-nums">
+                Page <strong>{matchPage}</strong> of <strong>{totalPages}</strong>
+                {" "}({matchTotalCount} total records · {matchPageSize} per page)
+                {matchesLoading && (
+                  <Loader2 className="ml-2 inline h-3.5 w-3.5 animate-spin text-[#929292]" />
+                )}
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={matchPage <= 1 || matchesLoading}
+                  onClick={() => goToPage(matchPage - 1)}
+                  className="inline-flex items-center gap-1 rounded-lg border border-[#EAEAE7] bg-white px-3 py-1.5 text-xs font-medium text-[#171717] hover:bg-[#F5F5F2] disabled:opacity-40"
+                >
+                  Previous
+                </button>
+                <button
+                  type="button"
+                  disabled={matchPage >= totalPages || matchesLoading}
+                  onClick={() => goToPage(matchPage + 1)}
+                  className="inline-flex items-center gap-1 rounded-lg border border-[#EAEAE7] bg-white px-3 py-1.5 text-xs font-medium text-[#171717] hover:bg-[#F5F5F2] disabled:opacity-40"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
           </>
         )}
       </div>
@@ -836,11 +900,21 @@ function MatchingResultsContent() {
         open={bulkConfirmOpen}
         onClose={() => setBulkConfirmOpen(false)}
         onConfirm={() => {
-          bulkApproveMatches(approvableSelectedIds);
-          setRowSelection({});
+          void bulkApproveMatches(approvableSelectedIds).then(() => {
+            setRowSelection({});
+            if (currentBatch) {
+              const batchUuid = currentBatch.uuid ?? currentBatch.id;
+              void fetchMatchPage(batchUuid, {
+                page: matchPage,
+                pageSize: matchPageSize,
+                status: statusFilter !== "all" ? statusFilter : undefined,
+                q: debouncedQuery || undefined,
+              });
+            }
+          });
         }}
         title={`Approve ${approvableSelectedIds.length} selected product(s)?`}
-        description="Only selected items that already have a candidate sticker reference will be marked Confirmed in local demonstration state."
+        description="Only selected items that already have a verified candidate sticker reference and no conflicts will be marked Confirmed."
         confirmLabel="Approve Selected"
         variant="approve"
       />

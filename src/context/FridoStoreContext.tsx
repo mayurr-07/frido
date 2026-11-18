@@ -38,6 +38,14 @@ interface BootstrapPayload {
   fetchedAt: string;
 }
 
+interface MatchAggregations {
+  confirmed: number;
+  needs_review: number;
+  conflict: number;
+  unmatched: number;
+  all: number;
+}
+
 interface FridoStoreContextValue {
   ready: boolean;
   error: string | null;
@@ -55,8 +63,19 @@ interface FridoStoreContextValue {
   introReplayNonce: number;
   authMode: "single_user" | "session";
 
+  // Server-side paginated matches
+  serverMatches: MatchResult[];
+  matchPage: number;
+  matchPageSize: number;
+  matchTotalCount: number;
+  matchAggregations: MatchAggregations | null;
+  matchesLoading: boolean;
+  matchStatusFilter: string;
+  matchQuery: string;
+
   refresh: () => Promise<void>;
   setActiveBatchId: (batchId: string) => void;
+  fetchMatchPage: (batchUuid: string, options: { page: number; pageSize: number; status?: string; q?: string }) => Promise<void>;
   uploadCsvFile: (file: File) => Promise<{ batchCode: string }>;
   uploadStickerDocument: (file: File) => Promise<{ stickerIdentifier: string; extractionStatus: string; missingFields: string[] }>;
   approveMatch: (matchId: string, stickerOverride?: StickerReference | null, note?: string) => Promise<void>;
@@ -110,6 +129,16 @@ export function FridoStoreProvider({ children }: { children: React.ReactNode }) 
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [introReplayNonce, setIntroReplayNonce] = useState(0);
 
+  // Server-side paginated match state
+  const [serverMatches, setServerMatches] = useState<MatchResult[]>([]);
+  const [matchPage, setMatchPage] = useState(1);
+  const [matchPageSize, setMatchPageSize] = useState(20);
+  const [matchTotalCount, setMatchTotalCount] = useState(0);
+  const [matchAggregations, setMatchAggregations] = useState<MatchAggregations | null>(null);
+  const [matchesLoading, setMatchesLoading] = useState(false);
+  const [matchStatusFilter, setMatchStatusFilter] = useState("");
+  const [matchQuery, setMatchQuery] = useState("");
+
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((toast) => toast.id !== id));
   }, []);
@@ -139,7 +168,43 @@ export function FridoStoreProvider({ children }: { children: React.ReactNode }) 
     }
   }, []);
 
-  // The external workspace API is the source of truth; bootstrap it once on mount.
+  const fetchMatchPage = useCallback(
+    async (batchUuid: string, options: { page: number; pageSize: number; status?: string; q?: string }) => {
+      if (!batchUuid) return;
+      setMatchesLoading(true);
+      try {
+        const params = new URLSearchParams({
+          batchId: batchUuid,
+          page: String(options.page),
+          pageSize: String(options.pageSize),
+        });
+        if (options.status && options.status !== "all") params.set("status", options.status);
+        if (options.q) params.set("q", options.q);
+        const result = await callApi<{
+          data: MatchResult[];
+          total: number;
+          filteredCount: number;
+          page: number;
+          pageSize: number;
+          aggregations: MatchAggregations;
+        }>(`/api/matches?${params.toString()}`);
+        setServerMatches(result.data);
+        setMatchTotalCount(result.total);
+        setMatchPage(result.page);
+        setMatchPageSize(result.pageSize);
+        setMatchAggregations(result.aggregations);
+        setMatchStatusFilter(options.status ?? "");
+        setMatchQuery(options.q ?? "");
+      } catch {
+        // Keep previous state on error — component will show its own error
+      } finally {
+        setMatchesLoading(false);
+      }
+    },
+    []
+  );
+
+  // Bootstrap on mount
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void refresh();
@@ -152,9 +217,20 @@ export function FridoStoreProvider({ children }: { children: React.ReactNode }) 
   const activities = useMemo(() => data?.activities ?? [], [data]);
 
   const activeBatch = useMemo(
-    () => batches.find((batch) => batch.id === activeBatchId) ?? batches[0],
+    () => batches.find((batch) => batch.id === activeBatchId || batch.uuid === activeBatchId) ?? batches[0],
     [batches, activeBatchId]
   );
+
+  // When activeBatchId changes (batch switch), call fetchMatchPage with the new batch's UUID (not batchCode, UUID)
+  useEffect(() => {
+    if (activeBatchId && batches.length > 0) {
+      const targetBatch = batches.find((b) => b.id === activeBatchId || b.uuid === activeBatchId);
+      const batchUuid = targetBatch?.uuid ?? targetBatch?.id ?? activeBatchId;
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      void fetchMatchPage(batchUuid, { page: 1, pageSize: 20 });
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeBatchId, batches]);
 
   const preferences = useMemo<UserPreferences>(() => {
     const stored = (data?.user ? {} : {}) as Record<string, unknown>;
@@ -355,8 +431,18 @@ export function FridoStoreProvider({ children }: { children: React.ReactNode }) 
     toasts,
     introReplayNonce,
     authMode: data?.authMode ?? "single_user",
+    // Server-side paginated matches
+    serverMatches,
+    matchPage,
+    matchPageSize,
+    matchTotalCount,
+    matchAggregations,
+    matchesLoading,
+    matchStatusFilter,
+    matchQuery,
     refresh,
     setActiveBatchId,
+    fetchMatchPage,
     uploadCsvFile,
     uploadStickerDocument,
     approveMatch,
