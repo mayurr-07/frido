@@ -51,6 +51,7 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
+  const start = performance.now();
   try {
     const user = await requireUser();
     const parsed = reportSchema.safeParse(await request.json().catch(() => null));
@@ -64,8 +65,18 @@ export async function POST(request: Request) {
       user,
     });
 
+    const totalDuration = (performance.now() - start).toFixed(1);
+    console.log(
+      `[timing] POST /api/reports batch=${parsed.data.batchId} type=${parsed.data.reportType} total=${totalDuration}ms products=${report.productCount}`
+    );
+
     return Response.json({ ok: true, report }, { status: 201 });
   } catch (error) {
+    const totalDuration = (performance.now() - start).toFixed(1);
+    console.error(
+      `[timing] POST /api/reports failed after ${totalDuration}ms:`,
+      error instanceof Error ? error.message : "unknown error"
+    );
     return apiErrorResponse(error);
   }
 }

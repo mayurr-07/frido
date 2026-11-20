@@ -14,6 +14,7 @@ import { hydrateMatchRows, productSelect, resolveBatch } from "@/server/reposito
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
+  const start = performance.now();
   try {
     await requireUser();
     await getWorkspaceIdentity();
@@ -26,7 +27,10 @@ export async function GET(request: Request) {
       throw new ApiError(422, "batchId query parameter is required");
     }
 
+    const tResolveStart = performance.now();
     const resolved = await resolveBatch(batchId);
+    const tResolve = (performance.now() - tResolveStart).toFixed(1);
+
     if (!resolved) {
       throw new ApiError(404, "Batch not found");
     }
@@ -40,6 +44,7 @@ export async function GET(request: Request) {
     const q = searchParams.get("q")?.trim();
 
     // 1. Full-batch aggregations (not limited to page or status/q filters)
+    const tAggStart = performance.now();
     const [aggRow] = await db
       .select({
         confirmed: sql<number>`count(*) filter (where ${matchResults.status} = 'confirmed')::int`,
@@ -50,6 +55,7 @@ export async function GET(request: Request) {
       })
       .from(matchResults)
       .where(eq(matchResults.batchId, resolved.batch.id));
+    const tAgg = (performance.now() - tAggStart).toFixed(1);
 
     const aggregations = {
       confirmed: aggRow?.confirmed ?? 0,
@@ -80,16 +86,19 @@ export async function GET(request: Request) {
     }
 
     // 3. Filtered count
+    const tCountStart = performance.now();
     const [countRow] = await db
       .select({ count: sql<number>`count(*)::int` })
       .from(matchResults)
       .innerJoin(importedProducts, eq(matchResults.productId, importedProducts.id))
       .leftJoin(stickerReferences, eq(matchResults.stickerId, stickerReferences.id))
       .where(and(...conditions));
+    const tCount = (performance.now() - tCountStart).toFixed(1);
 
     const filteredCount = countRow?.count ?? 0;
 
     // 4. Fetch paginated data
+    const tFetchStart = performance.now();
     const rows = await db
       .select(productSelect)
       .from(matchResults)
@@ -103,7 +112,15 @@ export async function GET(request: Request) {
       .limit(pageSize)
       .offset((page - 1) * pageSize);
 
+    const tHydrateStart = performance.now();
     const data = await hydrateMatchRows(rows);
+    const tHydrate = (performance.now() - tHydrateStart).toFixed(1);
+    const tFetch = (performance.now() - tFetchStart).toFixed(1);
+
+    const totalDuration = (performance.now() - start).toFixed(1);
+    console.log(
+      `[timing] GET /api/matches batch=${resolved.batch.batchCode} total=${totalDuration}ms (resolve=${tResolve}ms, agg=${tAgg}ms, count=${tCount}ms, fetch=${tFetch}ms [hydrate=${tHydrate}ms], rows=${data.length})`
+    );
 
     return Response.json({
       data,
@@ -114,6 +131,11 @@ export async function GET(request: Request) {
       aggregations,
     });
   } catch (error) {
+    const totalDuration = (performance.now() - start).toFixed(1);
+    console.error(
+      `[timing] GET /api/matches failed after ${totalDuration}ms:`,
+      error instanceof Error ? error.message : "unknown error"
+    );
     return apiErrorResponse(error);
   }
 }

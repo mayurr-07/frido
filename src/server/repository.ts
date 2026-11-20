@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   auditEvents,
@@ -737,6 +737,36 @@ export async function getBatchDetail(codeOrId: string) {
   };
 }
 
+export async function getBatchInvalidProducts(codeOrId: string) {
+  const resolved = await resolveBatch(codeOrId);
+  if (!resolved) throw new ApiError(404, "Batch not found");
+
+  const products = await db
+    .select({
+      id: importedProducts.id,
+      rowNumber: importedProducts.rowNumber,
+      productCode: importedProducts.productCode,
+      name: importedProducts.name,
+      mrp: importedProducts.mrp,
+      isValid: importedProducts.isValid,
+      issues: importedProducts.validationIssues,
+      raw: importedProducts.rawData,
+    })
+    .from(importedProducts)
+    .where(
+      and(
+        eq(importedProducts.batchId, resolved.batch.id),
+        eq(importedProducts.isValid, false)
+      )
+    )
+    .orderBy(asc(importedProducts.rowNumber));
+
+  return {
+    batch: toBatch(resolved.batch, resolved.uploaderName ?? "Unknown"),
+    invalidProducts: products,
+  };
+}
+
 /* ---------------------------------------------------------- review decisions */
 export async function recordReviewDecision(options: {
   matchId: string;
@@ -1080,6 +1110,35 @@ export async function addFamilyMapping(options: {
 }
 
 /* ------------------------------------------------------------------ reports */
+export async function countScopedMatchesForBatch(
+  batchId: string,
+  reportType: ReportType
+): Promise<number> {
+  const scope = reportTypeScope(reportType);
+  const conditions = [eq(matchResults.batchId, batchId)];
+
+  if (scope === "confirmed") {
+    conditions.push(eq(matchResults.status, "confirmed"));
+  } else if (scope === "conflict") {
+    conditions.push(eq(matchResults.status, "conflict"));
+  } else if (scope === "reviewed") {
+    conditions.push(
+      or(
+        sql`coalesce(${matchResults.reviewState}, '') != 'pending'`,
+        eq(matchResults.status, "needs_review"),
+        eq(matchResults.status, "conflict")
+      )!
+    );
+  }
+
+  const [row] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(matchResults)
+    .where(and(...conditions));
+
+  return row?.count ?? 0;
+}
+
 export async function createReport(options: {
   batchCodeOrId: string;
   reportType: ReportType;
@@ -1088,8 +1147,7 @@ export async function createReport(options: {
   const resolved = await resolveBatch(options.batchCodeOrId);
   if (!resolved) throw new ApiError(404, "Batch not found");
 
-  const matches = await fetchAllMatchesForBatch(resolved.batch.batchCode);
-  const scoped = scopeMatches(reportTypeScope(options.reportType), matches);
+  const productCount = await countScopedMatchesForBatch(resolved.batch.id, options.reportType);
   const sequence = await db.select({ count: sql<number>`count(*)::int` }).from(reports);
   const reportCode = `RPT-${new Date().getFullYear()}-${String(110 + (sequence[0]?.count ?? 0)).padStart(3, "0")}`;
 
@@ -1101,7 +1159,7 @@ export async function createReport(options: {
       reportType: options.reportType,
       generatedBy: options.user.id,
       generatedByName: options.user.displayName,
-      productCount: scoped.length,
+      productCount,
     })
     .returning();
 
@@ -1110,14 +1168,14 @@ export async function createReport(options: {
     actorName: options.user.displayName,
     type: "report_generated",
     title: `PDF report generated: ${reportCode}`,
-    description: `${options.reportType} report for ${resolved.batch.batchCode} (${scoped.length} products).`,
+    description: `${options.reportType} report for ${resolved.batch.batchCode} (${productCount} products).`,
     batchId: resolved.batch.id,
   });
 
   return toReport(inserted, resolved.batch.batchCode, resolved.batch);
 }
 
-function reportTypeScope(type: ReportType): string {
+export function reportTypeScope(type: ReportType): string {
   switch (type) {
     case "approved_only":
       return "confirmed";

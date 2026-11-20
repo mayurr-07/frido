@@ -24,7 +24,8 @@ function createPool(url: string | undefined): Pool {
     connectionString: url,
     ssl: isSslRequired ? { rejectUnauthorized: false } : undefined,
     max: 10,
-    idleTimeoutMillis: 10000,
+    maxUses: 1, // Cloudflare Workers: avoid reusing TCP sockets across different request lifecycles
+    idleTimeoutMillis: 1000,
     connectionTimeoutMillis: 15000,
   });
 
