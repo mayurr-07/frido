@@ -129,13 +129,13 @@ export default function SettingsPage() {
           fetch("/api/system", { cache: "no-store" }),
           fetch("/api/users", { cache: "no-store" }),
         ]);
-        const system = await systemResponse.json();
-        const usersPayload = await usersResponse.json();
+        const system = (await systemResponse.json()) as { error?: string } & Partial<SystemHealth>;
+        const usersPayload = (await usersResponse.json()) as { error?: string; users?: ManagedUser[] };
         if (!systemResponse.ok) throw new Error(system?.error ?? "Unable to load system health");
         if (!usersResponse.ok) throw new Error(usersPayload?.error ?? "Unable to load users");
         if (!cancelled) {
           setHealth(system as SystemHealth);
-          setManagedUsers(usersPayload.users as ManagedUser[]);
+          setManagedUsers((usersPayload.users ?? []) as ManagedUser[]);
         }
       } catch (error) {
         if (!cancelled) {

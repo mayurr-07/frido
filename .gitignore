@@ -37,6 +37,11 @@ pnpm-debug.log*
 # ---- Vercel / deployment ----
 .vercel
 
+# ---- OpenNext / Cloudflare ----
+.open-next/
+.wrangler/
+cloudflare-env.d.ts
+
 # ---- Test / coverage output ----
 coverage/
 .nyc_output/

@@ -1,12 +1,10 @@
-
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "frido",
   "main": ".open-next/worker.js",
-  "compatibility_date": "2026-11-18",
+  "compatibility_date": "2024-12-30",
   "compatibility_flags": [
-    "nodejs_compat",
-    "global_fetch_strictly_public"
+    "nodejs_compat"
   ],
   "assets": {
     "directory": ".open-next/assets",
@@ -17,8 +15,5 @@
       "binding": "WORKER_SELF_REFERENCE",
       "service": "frido"
     }
-  ],
-  "images": {
-    "binding": "IMAGES"
-  }
+  ]
 }
